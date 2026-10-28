@@ -1,0 +1,22 @@
+[Unit]
+Description=MIDI Mobile Manipulator Dual DDSM Motor & Gamepad Control Service
+After=network.target local-fs.target systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=simple
+# Adjust User and WorkingDirectory to match your Raspberry Pi username (usually 'pi' or your login name)
+User=pi
+Group=dialout
+WorkingDirectory=/home/pi/midi
+ExecStart=/usr/bin/python3 /home/pi/midi/main.py
+Restart=always
+RestartSec=3
+TimeoutStopSec=5
+KillSignal=SIGINT
+
+# Environment setup
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

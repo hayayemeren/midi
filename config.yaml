@@ -1,0 +1,52 @@
+# ==============================================================================
+# MIDI Mobile Manipulator Base Configuration
+# Dual DDSM Direct Drive Motors + Logitech F710 Gamepad + Waveshare UPS HAT
+# ==============================================================================
+
+# Serial RS485 Bus Configuration
+serial:
+  port: "/dev/ttyUSB0"          # RS485 USB-to-Serial adapter path
+  baudrate: 115200              # Standard DDSM baudrate
+  timeout: 0.05                 # Serial read timeout in seconds
+
+# Motor Parameters
+motors:
+  type: "ddsm115"               # "ddsm115" (1 RPM units) or "ddsm210" (0.1 RPM units)
+  left_id: 1                    # RS485 ID of Left Motor
+  right_id: 2                   # RS485 ID of Right Motor
+  invert_left: false            # Invert left motor direction if needed
+  invert_right: true            # Invert right motor (mirrored mounting on chassis)
+  acceleration_param: 50        # Internal motor acceleration parameter (0-255, 0.1ms/rev)
+
+# Mobile Manipulator Geometric & Kinematics Limits
+robot:
+  wheel_radius: 0.0575          # Radius in meters (DDSM115 tire is 115mm diameter -> 0.0575m)
+  wheel_base: 0.350             # Distance between left and right wheel contact points in meters
+  max_linear_speed: 0.80        # Maximum linear velocity in m/s (~2.88 km/h safe speed)
+  max_angular_speed: 2.0        # Maximum rotational velocity in rad/s (~115 deg/s)
+  max_motor_rpm: 140.0          # Absolute hardware RPM limit (DDSM115 rated ~143 RPM)
+  linear_accel_limit: 1.5       # Acceleration limit in m/s^2 (prevents jerky motions and tipping)
+  angular_accel_limit: 3.0      # Rotational acceleration limit in rad/s^2
+
+# Logitech Wireless Gamepad F710 Configuration
+gamepad:
+  device_path: null             # null = auto-detect (/dev/input/js0 or /dev/input/by-id/*F710*)
+  deadzone: 0.10                # Analog stick center deadzone (0.0 to 1.0) to eliminate drift
+  expo: 1.4                     # Exponential response curve for fine precision near center
+  require_deadman: false        # If true, Left Bumper (LB) must be held down to enable driving
+  speed_scale_crawl: 0.25       # Crawl / Precision mode multiplier (25% speed, for fine docking)
+  speed_scale_normal: 0.65      # Normal operating mode multiplier (65% speed)
+  speed_scale_turbo: 1.00       # Turbo mode multiplier (100% speed, triggered by Y or RT)
+
+# Waveshare UPS HAT / Battery Telemetry Configuration
+ups_hat:
+  enabled: true                 # Set to false to disable battery I2C monitoring
+  i2c_bus: 1                    # Raspberry Pi default I2C bus
+  i2c_address: "0x41"           # Waveshare UPS HAT INA219 I2C address (0x41, 0x42, or 0x43)
+  battery_type: "ups_2s"        # "ups_2s" (HAT internal 2S 8.4V pack) or "makita_18v" (18V 5S pack)
+
+# Control Loop Timing & Safety Watchdog
+control:
+  loop_hz: 25.0                 # Control loop frequency in Hz
+  watchdog_timeout: 0.50        # Stop motors if gamepad drops for >0.5s
+  telemetry_interval: 1.0       # Telemetry print interval in seconds
