@@ -117,3 +117,52 @@ def test_gamepad_drive_command_safety():
     assert lin == 0.0
     assert ang == 0.0
     assert not active
+
+
+def test_gamepad_stick_mapping_and_speed_bumpers():
+    """Verify Left stick Y controls linear, Right stick X controls steer, LB/RB control speed."""
+    gp = F710Gamepad(speed_levels=[0.20, 0.40, 0.60, 0.80, 1.00], default_speed_level=3)
+    gp._state.connected = True
+
+    # Default is Level 3 (0.60)
+    assert gp._state.speed_level == 3
+    assert abs(gp._state.speed_multiplier - 0.60) < 1e-4
+
+    # 1. Test stick mapping: Left stick Y = 1.0 (Forward), Right stick X = 0.5 (Steer Right)
+    gp._state.left_stick_y = 1.0
+    gp._state.right_stick_x = 0.5
+    gp._state.left_stick_x = 0.9  # Should be ignored for steering
+
+    lin, ang, active = gp.get_drive_command()
+    assert active
+    assert abs(lin - 0.60) < 1e-4  # 1.0 * 0.60
+    assert abs(ang - (-0.30)) < 1e-4  # -0.5 * 0.60 (right steer = negative ang)
+
+    # 2. Test LB (Speed UP): Level 3 -> 4 -> 5
+    gp.speed_up()
+    assert gp._state.speed_level == 4
+    assert abs(gp._state.speed_multiplier - 0.80) < 1e-4
+
+    gp.speed_up()
+    assert gp._state.speed_level == 5
+    assert abs(gp._state.speed_multiplier - 1.00) < 1e-4
+
+    # Speed up should cap at max (5)
+    gp.speed_up()
+    assert gp._state.speed_level == 5
+
+    # 3. Test RB (Speed DOWN): Level 5 -> 4 -> 3 -> 2 -> 1
+    gp.speed_down()
+    assert gp._state.speed_level == 4
+    gp.speed_down()
+    assert gp._state.speed_level == 3
+    gp.speed_down()
+    assert gp._state.speed_level == 2
+    gp.speed_down()
+    assert gp._state.speed_level == 1
+    assert abs(gp._state.speed_multiplier - 0.20) < 1e-4
+
+    # Speed down should floor at min (1)
+    gp.speed_down()
+    assert gp._state.speed_level == 1
+

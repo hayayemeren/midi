@@ -67,9 +67,8 @@ class MidiRobot:
             deadzone=float(gp_cfg.get("deadzone", 0.10)),
             expo=float(gp_cfg.get("expo", 1.4)),
             require_deadman=bool(gp_cfg.get("require_deadman", False)),
-            speed_scale_crawl=float(gp_cfg.get("speed_scale_crawl", 0.25)),
-            speed_scale_normal=float(gp_cfg.get("speed_scale_normal", 0.65)),
-            speed_scale_turbo=float(gp_cfg.get("speed_scale_turbo", 1.0)),
+            speed_levels=gp_cfg.get("speed_levels", [0.20, 0.40, 0.60, 0.80, 1.00]),
+            default_speed_level=int(gp_cfg.get("default_speed_level", 3)),
         )
 
         # 4. Battery / UPS HAT Configuration

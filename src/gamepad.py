@@ -16,7 +16,7 @@ import struct
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 logger = logging.getLogger("midi.gamepad")
 
@@ -30,9 +30,9 @@ JS_EVENT_INIT = 0x80
 class GamepadState:
     """Thread-safe snapshot of gamepad control inputs."""
     # Normalized sticks (-1.0 to +1.0)
-    left_stick_x: float = 0.0   # Left (-1.0) to Right (+1.0)
-    left_stick_y: float = 0.0   # Forward (+1.0) to Backward (-1.0)
-    right_stick_x: float = 0.0
+    left_stick_x: float = 0.0
+    left_stick_y: float = 0.0   # Forward (+1.0) / Backward (-1.0)
+    right_stick_x: float = 0.0  # Turn Left (-1.0) / Turn Right (+1.0)
     right_stick_y: float = 0.0
 
     # Triggers (-1.0 unpressed to +1.0 fully pressed, or 0.0 to 1.0)
@@ -48,8 +48,8 @@ class GamepadState:
     button_b: bool = False
     button_x: bool = False
     button_y: bool = False
-    button_lb: bool = False  # Left Bumper
-    button_rb: bool = False  # Right Bumper
+    button_lb: bool = False  # Left Bumper (Speed UP)
+    button_rb: bool = False  # Right Bumper (Speed DOWN)
     button_back: bool = False
     button_start: bool = False
     button_guide: bool = False
@@ -57,7 +57,10 @@ class GamepadState:
     # State metadata
     connected: bool = False
     emergency_stop_latched: bool = False
-    speed_mode: str = "normal"  # "crawl", "normal", "turbo"
+    speed_level: int = 3
+    max_speed_levels: int = 5
+    speed_multiplier: float = 0.60
+    speed_mode: str = "Level 3 (60%)"
     last_event_time: float = 0.0
 
 
@@ -70,28 +73,34 @@ class F710Gamepad:
         deadzone: float = 0.10,
         expo: float = 1.4,
         require_deadman: bool = False,
-        speed_scale_crawl: float = 0.25,
-        speed_scale_normal: float = 0.65,
-        speed_scale_turbo: float = 1.0,
+        speed_levels: Optional[List[float]] = None,
+        default_speed_level: int = 3,
     ):
         """Args:
             device_path: Explicit device path (e.g. /dev/input/js0). If None, auto-detects.
             deadzone: Analog stick deadband (0.0 to 1.0).
             expo: Exponential curve factor for smooth low-speed control.
             require_deadman: If True, Left Bumper (LB) must be held down to drive.
-            speed_scale_crawl: Fraction of max speed in crawl mode (e.g. 0.25).
-            speed_scale_normal: Fraction of max speed in normal mode (e.g. 0.65).
-            speed_scale_turbo: Fraction of max speed in turbo mode (e.g. 1.0).
+            speed_levels: List of speed scale multipliers (e.g. [0.2, 0.4, 0.6, 0.8, 1.0]).
+            default_speed_level: Initial speed level (1-indexed).
         """
         self.device_path = device_path
         self.deadzone = deadzone
         self.expo = expo
         self.require_deadman = require_deadman
-        self.speed_scale_crawl = speed_scale_crawl
-        self.speed_scale_normal = speed_scale_normal
-        self.speed_scale_turbo = speed_scale_turbo
+
+        self.speed_levels = speed_levels or [0.20, 0.40, 0.60, 0.80, 1.00]
+        self.default_speed_level = max(1, min(len(self.speed_levels), default_speed_level))
 
         self._state = GamepadState()
+        self._state.max_speed_levels = len(self.speed_levels)
+        self._state.speed_level = self.default_speed_level
+        self._state.speed_multiplier = self.speed_levels[self.default_speed_level - 1]
+        self._state.speed_mode = f"Level {self._state.speed_level} ({self._state.speed_multiplier*100:.0f}%)"
+
+        self._prev_lb = False
+        self._prev_rb = False
+
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -116,10 +125,27 @@ class F710Gamepad:
             self._thread.join(timeout=1.0)
         logger.info("Gamepad worker thread stopped.")
 
+    def speed_up(self):
+        """Increase speed gear/level by 1 (triggered by Left Bumper)."""
+        with self._lock:
+            if self._state.speed_level < len(self.speed_levels):
+                self._state.speed_level += 1
+                self._state.speed_multiplier = self.speed_levels[self._state.speed_level - 1]
+                self._state.speed_mode = f"Level {self._state.speed_level} ({self._state.speed_multiplier*100:.0f}%)"
+                logger.info("[GAMEPAD] Speed UP -> %s", self._state.speed_mode)
+
+    def speed_down(self):
+        """Decrease speed gear/level by 1 (triggered by Right Bumper)."""
+        with self._lock:
+            if self._state.speed_level > 1:
+                self._state.speed_level -= 1
+                self._state.speed_multiplier = self.speed_levels[self._state.speed_level - 1]
+                self._state.speed_mode = f"Level {self._state.speed_level} ({self._state.speed_multiplier*100:.0f}%)"
+                logger.info("[GAMEPAD] Speed DOWN -> %s", self._state.speed_mode)
+
     def get_state(self) -> GamepadState:
         """Return a thread-safe copy of the current gamepad state."""
         with self._lock:
-            # Create a shallow copy
             return GamepadState(
                 left_stick_x=self._state.left_stick_x,
                 left_stick_y=self._state.left_stick_y,
@@ -140,6 +166,9 @@ class F710Gamepad:
                 button_guide=self._state.button_guide,
                 connected=self._state.connected,
                 emergency_stop_latched=self._state.emergency_stop_latched,
+                speed_level=self._state.speed_level,
+                max_speed_levels=self._state.max_speed_levels,
+                speed_multiplier=self._state.speed_multiplier,
                 speed_mode=self._state.speed_mode,
                 last_event_time=self._state.last_event_time,
             )
@@ -147,10 +176,13 @@ class F710Gamepad:
     def get_drive_command(self) -> tuple[float, float, bool]:
         """Compute drive throttle and steering commands from current state.
         
+        Controls:
+          - Left Stick Y  : Forward / Backward (linear velocity v)
+          - Right Stick X : Left / Right (angular velocity omega)
+          - Speed Scaling : Controlled by LB (Speed Up) and RB (Speed Down)
+        
         Returns:
             Tuple of (linear_throttle [-1..1], angular_steering [-1..1], is_active [bool])
-            Where is_active is True only if controller is connected, safety checks pass,
-            and E-Stop is not latched.
         """
         state = self.get_state()
 
@@ -162,25 +194,21 @@ class F710Gamepad:
         if self.require_deadman and not state.button_lb:
             return 0.0, 0.0, False
 
-        # Determine speed multiplier
-        if state.speed_mode == "crawl" or state.button_rb:
-            multiplier = self.speed_scale_crawl
-        elif state.speed_mode == "turbo" or state.right_trigger > 0.5:
-            multiplier = self.speed_scale_turbo
-        else:
-            multiplier = self.speed_scale_normal
+        multiplier = state.speed_multiplier
 
-        # Left stick Y = Linear throttle (forward is positive)
-        # Left stick X = Steering (turn left is positive)
+        # Left stick Y = Forward / Backward
+        # Right stick X = Left / Right Steering
         linear = state.left_stick_y * multiplier
-        angular = -state.left_stick_x * multiplier  # Invert so push-left produces positive turn (CCW)
+        # Invert right_stick_x: pushing LEFT (-1) produces positive angular speed (CCW turn)
+        angular = -state.right_stick_x * multiplier
 
-        # Allow D-Pad for precision inching
+        # Allow D-Pad for fine inching (uses minimum crawl speed)
         if abs(linear) < 0.05 and abs(angular) < 0.05:
+            min_speed = self.speed_levels[0]
             if state.dpad_y != 0.0:
-                linear = state.dpad_y * self.speed_scale_crawl
+                linear = state.dpad_y * min_speed
             if state.dpad_x != 0.0:
-                angular = -state.dpad_x * self.speed_scale_crawl
+                angular = -state.dpad_x * min_speed
 
         return linear, angular, True
 
@@ -246,7 +274,6 @@ class F710Gamepad:
             self._fd = None
         with self._lock:
             self._state.connected = False
-            # Zero stick inputs on disconnect for safety
             self._state.left_stick_x = 0.0
             self._state.left_stick_y = 0.0
             self._state.right_stick_x = 0.0
@@ -263,14 +290,12 @@ class F710Gamepad:
                     continue
 
             try:
-                # Read 8-byte event
                 event_data = os.read(self._fd, event_size)
                 if not event_data or len(event_data) < event_size:
                     time.sleep(0.01)
                     continue
 
                 event_time, value, event_type, number = struct.unpack("IhBB", event_data)
-                # Ignore initial configuration events
                 is_init = bool(event_type & JS_EVENT_INIT)
                 pure_type = event_type & ~JS_EVENT_INIT
 
@@ -292,7 +317,7 @@ class F710Gamepad:
             self._state.last_event_time = time.time()
 
             # Map standard XInput / DirectInput buttons
-            if number == 0:  # A button
+            if number == 0:  # A button -> Reset E-Stop
                 self._state.button_a = pressed
                 if pressed and self._state.emergency_stop_latched:
                     self._state.emergency_stop_latched = False
@@ -302,29 +327,26 @@ class F710Gamepad:
                 if pressed:
                     self._state.emergency_stop_latched = True
                     logger.warning("[GAMEPAD] EMERGENCY STOP triggered by button B!")
-            elif number == 2:  # X button -> Normal speed
+            elif number == 2:  # X button
                 self._state.button_x = pressed
-                if pressed:
-                    self._state.speed_mode = "normal"
-                    logger.info("[GAMEPAD] Speed mode: NORMAL")
-            elif number == 3:  # Y button -> Turbo speed
+            elif number == 3:  # Y button
                 self._state.button_y = pressed
-                if pressed:
-                    self._state.speed_mode = "turbo"
-                    logger.info("[GAMEPAD] Speed mode: TURBO")
-            elif number == 4:  # LB (Left Bumper) -> Deadman switch
+            elif number == 4:  # LB (Left Bumper) -> SPEED UP
                 self._state.button_lb = pressed
-            elif number == 5:  # RB (Right Bumper) -> Crawl speed
+                if pressed and not self._prev_lb:
+                    self.speed_up()
+                self._prev_lb = pressed
+            elif number == 5:  # RB (Right Bumper) -> SPEED DOWN
                 self._state.button_rb = pressed
-                if pressed:
-                    self._state.speed_mode = "crawl"
-                    logger.info("[GAMEPAD] Speed mode: CRAWL")
+                if pressed and not self._prev_rb:
+                    self.speed_down()
+                self._prev_rb = pressed
             elif number == 6:  # Back button -> E-Stop
                 self._state.button_back = pressed
                 if pressed:
                     self._state.emergency_stop_latched = True
                     logger.warning("[GAMEPAD] EMERGENCY STOP triggered by BACK button!")
-            elif number == 7:  # Start button -> Reset E-Stop / Arm
+            elif number == 7:  # Start button -> Reset E-Stop
                 self._state.button_start = pressed
                 if pressed and self._state.emergency_stop_latched:
                     self._state.emergency_stop_latched = False
@@ -334,7 +356,6 @@ class F710Gamepad:
 
     def _handle_axis(self, number: int, raw_value: int):
         """Process analog stick and trigger movements."""
-        # Convert -32767..32767 to -1.0..1.0
         norm_val = raw_value / 32767.0
         norm_val = max(-1.0, min(1.0, norm_val))
 
@@ -343,13 +364,13 @@ class F710Gamepad:
 
             if number == 0:  # Left stick X (Horizontal)
                 self._state.left_stick_x = self._apply_deadzone_and_expo(norm_val)
-            elif number == 1:  # Left stick Y (Vertical, invert so Forward is +1.0)
+            elif number == 1:  # Left stick Y (Vertical, invert so Push Forward is +1.0)
                 self._state.left_stick_y = self._apply_deadzone_and_expo(-norm_val)
-            elif number == 2:  # LT (Left Trigger) or Right Stick X (in DirectInput)
+            elif number == 2:  # LT (Left Trigger)
                 self._state.left_trigger = (norm_val + 1.0) / 2.0
-            elif number == 3:  # Right stick X
+            elif number == 3:  # Right stick X (Horizontal, Steering)
                 self._state.right_stick_x = self._apply_deadzone_and_expo(norm_val)
-            elif number == 4:  # Right stick Y (invert so Forward is +1.0)
+            elif number == 4:  # Right stick Y (Vertical)
                 self._state.right_stick_y = self._apply_deadzone_and_expo(-norm_val)
             elif number == 5:  # RT (Right Trigger)
                 self._state.right_trigger = (norm_val + 1.0) / 2.0

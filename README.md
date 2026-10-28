@@ -53,15 +53,13 @@ Control software for a mobile manipulator base powered by dual **DDSM direct-dri
 
 | Control Input | Function | Description |
 | :--- | :--- | :--- |
-| **Left Stick (Vertical)** | **Throttle (Linear $v$)** | Push Forward to drive forward, Pull Back to reverse |
-| **Left Stick (Horizontal)**| **Steering (Angular $\omega$)**| Push Left to turn counter-clockwise, Right to turn clockwise |
-| **Button B** | **EMERGENCY STOP** | Instantly halts both motors and engages electric brake |
-| **Button A** | **Clear E-Stop** | Clears the emergency stop latch and re-arms the drive base |
-| **Button X** | **Normal Mode** | Sets drive speed to Normal profile (65% max speed) |
-| **Button Y** | **Turbo Mode** | Sets drive speed to Turbo profile (100% max speed) |
-| **Right Bumper (RB)** | **Crawl / Precision Mode**| Enables 25% low-speed crawl mode for delicate manipulator placement |
-| **Left Bumper (LB)** | **Deadman Switch** | *(Optional)* If enabled in `config.yaml`, must be held to drive |
-| **D-Pad (Up/Down/Left/Right)** | **Fine Inching** | Precise pulse nudging for docking maneuvers |
+| **Left Stick (Vertical)** | **Drive Forward / Backward ($v$)** | Push Forward to drive forward, Pull Back to reverse |
+| **Right Stick (Horizontal)**| **Steer Left / Right ($\omega$)** | Push Left to turn counter-clockwise, Right to turn clockwise |
+| **Left Bumper (LB)** | **Speed UP (+)** | Increases speed level by 1 gear (20% → 40% → 60% → 80% → 100%) |
+| **Right Bumper (RB)** | **Speed DOWN (-)** | Decreases speed level by 1 gear (100% → 80% → 60% → 40% → 20%) |
+| **Button B / BACK** | **EMERGENCY STOP** | Instantly halts both motors and engages electric brake |
+| **Button A / START**| **Clear E-Stop** | Clears the emergency stop latch and re-arms the drive base |
+| **D-Pad (Up/Down/Left/Right)** | **Fine Inching** | Precision low-speed pulse nudging for docking maneuvers |
 
 ---
 

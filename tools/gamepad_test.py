@@ -52,14 +52,14 @@ def main():
             print("=" * 65)
             print("       LOGITECH F710 WIRELESS GAMEPAD DIAGNOSTICS       ")
             print("=" * 65)
-            print(f" Status     : {status_str} | Mode: [{state.speed_mode.upper()}]")
+            print(f" Status     : {status_str} | Speed Gear: [{state.speed_mode.upper()}]")
             print(f" Drive State: {active_str}")
             print(f" E-Stop Latched: {'YES (Press A to reset)' if state.emergency_stop_latched else 'NO'}")
             print("-" * 65)
-            print(f" Left Stick X (Steer)  : [{format_bar(state.left_stick_x)}] {state.left_stick_x:+.2f}")
-            print(f" Left Stick Y (Drive)  : [{format_bar(state.left_stick_y)}] {state.left_stick_y:+.2f}")
-            print(f" Right Stick X         : [{format_bar(state.right_stick_x)}] {state.right_stick_x:+.2f}")
-            print(f" Right Stick Y         : [{format_bar(state.right_stick_y)}] {state.right_stick_y:+.2f}")
+            print(f" Left Stick Y (Drive Fwd/Rev) : [{format_bar(state.left_stick_y)}] {state.left_stick_y:+.2f}")
+            print(f" Right Stick X (Steer L/R)    : [{format_bar(state.right_stick_x)}] {state.right_stick_x:+.2f}")
+            print(f" Left Stick X (Unassigned)    : [{format_bar(state.left_stick_x)}] {state.left_stick_x:+.2f}")
+            print(f" Right Stick Y (Unassigned)   : [{format_bar(state.right_stick_y)}] {state.right_stick_y:+.2f}")
             print("-" * 65)
             print(f" Triggers  : LT={state.left_trigger:.2f} | RT={state.right_trigger:.2f}")
             print(f" D-Pad     : X={state.dpad_x:+.0f} | Y={state.dpad_y:+.0f}")
@@ -68,10 +68,8 @@ def main():
             buttons = [
                 ("A (Reset)", state.button_a),
                 ("B (E-Stop)", state.button_b),
-                ("X (Norm)", state.button_x),
-                ("Y (Turbo)", state.button_y),
-                ("LB (Deadman)", state.button_lb),
-                ("RB (Crawl)", state.button_rb),
+                ("LB (Speed UP)", state.button_lb),
+                ("RB (Speed DOWN)", state.button_rb),
                 ("BACK", state.button_back),
                 ("START", state.button_start),
             ]
@@ -81,10 +79,12 @@ def main():
             print(f" OUTPUT COMMANDS -> Linear: {throttle:+.2f} | Angular: {steering:+.2f}")
             print("=" * 65)
             print("Controls Guide:")
-            print(" - Left Stick: Push UP/DOWN to drive, LEFT/RIGHT to steer")
+            print(" - Left Stick: Push UP/DOWN to drive forward / backward")
+            print(" - Right Stick: Push LEFT/RIGHT to steer left / right")
+            print(" - Left Bumper (LB): Speed UP (+ gear / speed level)")
+            print(" - Right Bumper (RB): Speed DOWN (- gear / speed level)")
             print(" - Button B or BACK: Instant Emergency Stop (cuts motors)")
             print(" - Button A or START: Clear Emergency Stop")
-            print(" - Button X / Y / RB: Switch speed (Normal / Turbo / Crawl)")
 
             time.sleep(0.1)
     except KeyboardInterrupt:

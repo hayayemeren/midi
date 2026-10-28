@@ -34,9 +34,8 @@ gamepad:
   deadzone: 0.10                # Analog stick center deadzone (0.0 to 1.0) to eliminate drift
   expo: 1.4                     # Exponential response curve for fine precision near center
   require_deadman: false        # If true, Left Bumper (LB) must be held down to enable driving
-  speed_scale_crawl: 0.25       # Crawl / Precision mode multiplier (25% speed, for fine docking)
-  speed_scale_normal: 0.65      # Normal operating mode multiplier (65% speed)
-  speed_scale_turbo: 1.00       # Turbo mode multiplier (100% speed, triggered by Y or RT)
+  speed_levels: [0.20, 0.40, 0.60, 0.80, 1.00]  # Speed levels (LB = speed up, RB = speed down)
+  default_speed_level: 3        # Default level on start (Level 3 = 60%)
 
 # Waveshare UPS HAT / Battery Telemetry Configuration
 ups_hat:
