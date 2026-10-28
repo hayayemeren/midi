@@ -1,7 +1,7 @@
-"""MIDI Mobile Manipulator Base Coordinator.
+"""MIDI Mobile Manipulator Base Controller.
 
-Integrates Gamepad input, Differential Drive kinematics, dual DDSM RS485 motors,
-safety watchdog, and battery telemetry into an active control loop.
+Synchronous 50 Hz control loop with evdev gamepad polling, asymmetric slew rate
+ramping, and collision-free RS485 DDSM motor drive.
 """
 
 from __future__ import annotations
@@ -13,11 +13,28 @@ import time
 from typing import Dict, Any, Optional
 
 from src.ddsm import DDSMDriver, MotorFeedback
-from src.diff_drive import DifferentialDrive, RobotDimensions
 from src.gamepad import F710Gamepad, GamepadState
 from src.ups_battery import WaveshareUPSMonitor, BatteryTelemetry
 
 logger = logging.getLogger("midi.robot")
+
+
+def slew(cur: float, tgt: float, up: float, down: float, dt: float) -> float:
+    """Asymmetric slew rate limiter for smooth acceleration and crisp stopping."""
+    # If increasing magnitude in same direction, use acceleration rate; else deceleration rate
+    rate = up if abs(tgt) > abs(cur) and tgt * cur >= 0 else down
+    s = rate * dt
+
+    if tgt > cur:
+        val = min(tgt, cur + s)
+    else:
+        val = max(tgt, cur - s)
+
+    # Snap to exactly 0 when target is zero and close to eliminate creep
+    if abs(tgt) < 1e-4 and abs(val) < max(1.0, s):
+        return 0.0
+
+    return val
 
 
 class MidiRobot:
@@ -32,43 +49,33 @@ class MidiRobot:
         serial_cfg = config.get("serial", {})
         self.left_id = int(motors_cfg.get("left_id", 1))
         self.right_id = int(motors_cfg.get("right_id", 2))
-        self.accel_param = int(motors_cfg.get("acceleration_param", 50))
+        self.left_dir = -1 if bool(motors_cfg.get("invert_left", False)) else 1
+        self.right_dir = -1 if bool(motors_cfg.get("invert_right", True)) else 1
         self.motor_type = motors_cfg.get("type", "ddsm115")
 
         self.driver = DDSMDriver(
             port=serial_cfg.get("port", "/dev/ttyUSB0"),
             baudrate=int(serial_cfg.get("baudrate", 115200)),
-            timeout=float(serial_cfg.get("timeout", 0.05)),
+            timeout=float(serial_cfg.get("timeout", 0.02)),
             dry_run=bool(config.get("dry_run", False)),
             motor_type=self.motor_type,
         )
 
-        # 2. Kinematics Configuration
+        # 2. Kinematics & Ramping
         robot_cfg = config.get("robot", {})
-        dims = RobotDimensions(
-            wheel_radius=float(robot_cfg.get("wheel_radius", 0.0575)),
-            wheel_base=float(robot_cfg.get("wheel_base", 0.350)),
-            max_linear_speed=float(robot_cfg.get("max_linear_speed", 0.8)),
-            max_angular_speed=float(robot_cfg.get("max_angular_speed", 2.0)),
-            max_motor_rpm=float(robot_cfg.get("max_motor_rpm", 140.0)),
-            invert_left=bool(motors_cfg.get("invert_left", False)),
-            invert_right=bool(motors_cfg.get("invert_right", True)),
-        )
-        self.diff_drive = DifferentialDrive(
-            dimensions=dims,
-            linear_accel_limit=float(robot_cfg.get("linear_accel_limit", 1.5)),
-            angular_accel_limit=float(robot_cfg.get("angular_accel_limit", 3.0)),
-        )
+        self.turn_ratio = float(robot_cfg.get("turn_ratio", 0.65))
+        self.turn_dir = int(robot_cfg.get("turn_dir", 1))
+        self.accel_rate = float(robot_cfg.get("accel_rate", 1500.0))    # RPM / s
+        self.decel_rate = float(robot_cfg.get("decel_rate", 1000.0))   # RPM / s on stick release
+        self.brake_rate = float(robot_cfg.get("brake_rate", 3000.0))   # RPM / s on B button
 
         # 3. Gamepad Configuration
         gp_cfg = config.get("gamepad", {})
         self.gamepad = F710Gamepad(
             device_path=gp_cfg.get("device_path", None),
             deadzone=float(gp_cfg.get("deadzone", 0.10)),
-            expo=float(gp_cfg.get("expo", 1.4)),
-            require_deadman=bool(gp_cfg.get("require_deadman", False)),
-            speed_levels=gp_cfg.get("speed_levels", [0.20, 0.40, 0.60, 0.80, 1.00]),
-            default_speed_level=int(gp_cfg.get("default_speed_level", 3)),
+            speed_levels=gp_cfg.get("speed_levels", [50.0, 100.0, 150.0, 200.0]),
+            default_speed_level=int(gp_cfg.get("default_speed_level", 1)),
         )
 
         # 4. Battery / UPS HAT Configuration
@@ -80,167 +87,161 @@ class MidiRobot:
             enabled=bool(ups_cfg.get("enabled", True)),
         )
 
-        # 5. Timing and Watchdog
+        # 5. Timing
         control_cfg = config.get("control", {})
-        self.loop_hz = float(control_cfg.get("loop_hz", 25.0))
-        self.watchdog_timeout = float(control_cfg.get("watchdog_timeout", 0.5))
-        self.telemetry_interval = float(control_cfg.get("telemetry_interval", 1.0))
+        self.loop_hz = float(control_cfg.get("loop_hz", 50.0))
+        self.telemetry_interval = float(control_cfg.get("telemetry_interval", 0.25))
 
-        # Internal state
-        self.last_cmd_time = 0.0
-        self.last_telemetry_time = 0.0
-        self._target_left_rpm = 0.0
-        self._target_right_rpm = 0.0
+        # Runtime states
+        self.cur_left_rpm = 0.0
+        self.cur_right_rpm = 0.0
+        self.last_print_time = 0.0
 
     def start(self):
         """Initialize all subsystems and run control loop."""
         logger.info("Initializing MIDI Mobile Manipulator Controller...")
 
-        # Setup OS signal handlers for graceful shutdown
+        # Setup OS signal handlers
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
 
         # Connect RS485 serial bus
         if not self.driver.connect():
-            logger.error("Could not initialize RS485 communication. Exiting.")
+            logger.error("Could not connect to RS485 bus on %s. Exiting.", self.driver.port)
             sys.exit(1)
 
-        # Set motors to Velocity Loop Mode
+        # Set motors to Velocity Mode (0x02)
         logger.info("Setting DDSM motors (ID %d, ID %d) to Velocity Mode...", self.left_id, self.right_id)
         self.driver.set_mode(self.left_id, DDSMDriver.MODE_VELOCITY)
-        time.sleep(0.02)
+        time.sleep(0.05)
         self.driver.set_mode(self.right_id, DDSMDriver.MODE_VELOCITY)
-        time.sleep(0.02)
+        time.sleep(0.05)
 
-        # Start Gamepad reader thread
-        self.gamepad.start()
+        # Connect Gamepad
+        logger.info("Searching for Logitech Gamepad...")
+        self.gamepad.connect()
 
         # Initialize UPS HAT
         self.ups.init()
 
-        logger.info("System ready. Control loop active at %.1f Hz. Waiting for gamepad...", self.loop_hz)
+        logger.info("Ready! Running at %.0f Hz. (Left Stick: Fwd/Rev | Right Stick: Steer | LB: Speed+ | RB: Speed- | B: Brake)", self.loop_hz)
         self.running = True
         self._run_loop()
 
     def _run_loop(self):
-        """High-frequency control loop."""
-        dt = 1.0 / self.loop_hz
+        """Zero-latency synchronous control loop."""
+        period = 1.0 / self.loop_hz
+        t_prev = time.time()
 
         while self.running:
-            start_time = time.time()
-
-            # 1. Read Gamepad inputs
-            linear_norm, angular_norm, is_active = self.gamepad.get_drive_command()
-            gp_state = self.gamepad.get_state()
-
-            # 2. Safety and Drive command calculation
-            if not gp_state.connected:
-                # Controller disconnected: full stop
-                target_v = 0.0
-                target_w = 0.0
-                is_braking = True
-            elif gp_state.emergency_stop_latched:
-                # E-stop latched: full stop and brake
-                target_v = 0.0
-                target_w = 0.0
-                is_braking = True
-            elif not is_active:
-                # Inactive / Deadman released
-                target_v = 0.0
-                target_w = 0.0
-                is_braking = False
-            else:
-                # Continuous driving for as long as stick is held
-                target_v = linear_norm * self.diff_drive.dims.max_linear_speed
-                target_w = angular_norm * self.diff_drive.dims.max_angular_speed
-                is_braking = False
-
-            # 3. Kinematics calculation with acceleration slew rate limiting
-            left_rpm, right_rpm = self.diff_drive.twist_to_rpm(
-                target_v, target_w, apply_ramping=not is_braking
-            )
-            self._target_left_rpm = left_rpm
-            self._target_right_rpm = right_rpm
-
-            # 4. Transmit velocity commands to DDSM motors
-            # Each call synchronously writes and reads back 10 bytes to keep RS485 clear
-            if is_braking:
-                self.driver.emergency_brake(self.left_id)
-                time.sleep(0.002)
-                self.driver.emergency_brake(self.right_id)
-            else:
-                self.driver.set_velocity(
-                    self.left_id, left_rpm, acceleration=self.accel_param
-                )
-                time.sleep(0.002)
-                self.driver.set_velocity(
-                    self.right_id, right_rpm, acceleration=self.accel_param
-                )
-
-            # 5. Periodic Telemetry and Logging
             now = time.time()
-            if now - self.last_telemetry_time >= self.telemetry_interval:
-                self.last_telemetry_time = now
-                self._log_status(gp_state)
+            dt = max(0.001, min(0.1, now - t_prev))
+            t_prev = now
 
-            # 6. Sleep remainder of loop interval
-            elapsed = time.time() - start_time
-            sleep_time = dt - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+            # 1. Synchronous Gamepad Poll (instant event drain)
+            gp = self.gamepad.poll()
 
-    def _log_status(self, gp_state: GamepadState):
-        """Log health and status periodically."""
-        # Query feedback from motors
-        fb_left = self.driver.query_feedback(self.left_id)
-        fb_right = self.driver.query_feedback(self.right_id)
-        batt = self.ups.read()
+            if gp.button_start_pressed:
+                logger.info("START button pressed. Exiting...")
+                break
 
-        l_act_rpm = fb_left.velocity_rpm if fb_left else 0.0
-        r_act_rpm = fb_right.velocity_rpm if fb_right else 0.0
-        est_v, est_w = self.diff_drive.rpm_to_twist(l_act_rpm, r_act_rpm)
+            if gp.connected:
+                fwd = gp.forward
+                turn = gp.turn * self.turn_ratio * self.turn_dir
+            else:
+                fwd = 0.0
+                turn = 0.0
 
-        conn_str = "CONNECTED" if gp_state.connected else "WAITING"
-        mode_str = f"[{gp_state.speed_mode.upper()}]"
-        estop_str = " [E-STOP ACTIVE]" if gp_state.emergency_stop_latched else ""
+            # 2. Twist Mixing (Forward + Turn)
+            l = fwd + turn
+            r = fwd - turn
+            scale = max(1.0, abs(l), abs(r))
+            vmax = gp.speed_rpm
 
-        batt_info = ""
-        if batt.connected:
-            batt_info = f" | Batt: {batt.bus_voltage_v:.1f}V ({batt.percentage:.0f}%)"
+            hedef_l = (l / scale) * vmax
+            hedef_r = (r / scale) * vmax
 
-        logger.info(
-            "GP: %s %s%s | Cmd: L=%.1f R=%.1f RPM | Act: L=%.1f R=%.1f RPM (v=%.2fm/s w=%.2frad/s)%s",
-            conn_str, mode_str, estop_str,
-            self._target_left_rpm, self._target_right_rpm,
-            l_act_rpm, r_act_rpm, est_v, est_w,
-            batt_info,
+            # 3. Brake handling (B button held)
+            fren = gp.connected and gp.brake
+            if fren:
+                hedef_l = 0.0
+                hedef_r = 0.0
+                dec = self.brake_rate
+            else:
+                dec = self.decel_rate
+
+            # 4. Asymmetric Slew Rate Ramping
+            self.cur_left_rpm = slew(self.cur_left_rpm, hedef_l, self.accel_rate, dec, dt)
+            self.cur_right_rpm = slew(self.cur_right_rpm, hedef_r, self.accel_rate, dec, dt)
+
+            # 5. Send velocity commands to DDSM motors
+            # Each call transmits [ID, 0x64, Speed_H, Speed_L, 0, 0, 1, Brake, 0, CRC]
+            # and immediately reads the 10-byte feedback frame
+            fb_l = self.driver.set_velocity(
+                self.left_id,
+                self.left_dir * self.cur_left_rpm,
+                acceleration=1,
+                brake=fren,
+            )
+            time.sleep(0.002)  # 2ms transceiver turnaround
+            fb_r = self.driver.set_velocity(
+                self.right_id,
+                self.right_dir * self.cur_right_rpm,
+                acceleration=1,
+                brake=fren,
+            )
+
+            # 6. Periodic Status Print
+            if now - self.last_print_time >= self.telemetry_interval:
+                self.last_print_time = now
+                self._print_status(gp, fren, fb_l, fb_r)
+
+            # 7. Sleep remainder of loop interval
+            rest = period - (time.time() - now)
+            if rest > 0:
+                time.sleep(rest)
+
+    def _print_status(self, gp: GamepadState, fren: bool, fb_l: Optional[MotorFeedback], fb_r: Optional[MotorFeedback]):
+        l_act = f"{fb_l.velocity_rpm:+4.0f}" if fb_l else "----"
+        r_act = f"{fb_r.velocity_rpm:+4.0f}" if fb_r else "----"
+        conn_str = "CONNECTED" if gp.connected else "NO GAMEPAD"
+        brake_str = " | BRAKE" if fren else ""
+
+        sys.stdout.write(
+            f"\rGP: {conn_str:<10} | Fwd: {gp.forward:+4.2f} Steer: {gp.turn:+4.2f} | "
+            f"Cmd: L={int(self.cur_left_rpm):+4d} R={int(self.cur_right_rpm):+4d} RPM | "
+            f"Act: L={l_act} R={r_act} RPM | Gear: {gp.speed_rpm:.0f} RPM (Lv {gp.speed_level+1}){brake_str}   "
         )
+        sys.stdout.flush()
 
     def _handle_signal(self, signum, frame):
-        """Safely handle termination signals."""
-        logger.info("Signal %d received. Initiating safe robot shutdown...", signum)
+        logger.info("\nSignal %d received. Stopping robot safely...", signum)
         self.stop()
         sys.exit(0)
 
     def stop(self):
-        """Halt motors, stop threads, close hardware connections."""
+        """Smoothly bring motors to halt and close bus."""
         self.running = False
-        logger.info("Stopping robot...")
+        print("\nStopping robot...")
 
-        # 1. Stop motors and apply brake
+        # Smooth decelerate to 0
+        t0 = time.time()
+        while (abs(self.cur_left_rpm) > 1 or abs(self.cur_right_rpm) > 1) and time.time() - t0 < 1.0:
+            self.cur_left_rpm = slew(self.cur_left_rpm, 0.0, 0.0, self.brake_rate, 0.02)
+            self.cur_right_rpm = slew(self.cur_right_rpm, 0.0, 0.0, self.brake_rate, 0.02)
+            self.driver.set_velocity(self.left_id, self.left_dir * self.cur_left_rpm, acceleration=1)
+            time.sleep(0.002)
+            self.driver.set_velocity(self.right_id, self.right_dir * self.cur_right_rpm, acceleration=1)
+            time.sleep(0.02)
+
+        # Final 0 RPM stop
         try:
-            self.diff_drive.emergency_stop()
             self.driver.emergency_brake(self.left_id)
+            time.sleep(0.002)
             self.driver.emergency_brake(self.right_id)
-            time.sleep(0.05)
-            self.driver.set_velocity(self.left_id, 0.0, brake=True)
-            self.driver.set_velocity(self.right_id, 0.0, brake=True)
-        except Exception as e:
-            logger.warning("Error commanding motor stop during shutdown: %s", e)
+        except Exception:
+            pass
 
-        # 2. Stop gamepad
-        self.gamepad.stop()
-
-        # 3. Close RS485 bus
+        self.gamepad.close()
         self.driver.close()
-        logger.info("Robot shutdown complete.")
+        print("Motors halted safely. RS485 bus closed.")

@@ -31,6 +31,7 @@ if command -v apt-get &> /dev/null; then
         python3-yaml \
         python3-serial \
         python3-smbus \
+        python3-evdev \
         i2c-tools \
         joystick
 else

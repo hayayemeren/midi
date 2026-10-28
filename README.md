@@ -49,17 +49,16 @@ Control software for a mobile manipulator base powered by dual **DDSM direct-dri
 ## Logitech F710 Gamepad Control Mapping
 
 > [!TIP]
-> Ensure the hardware slide switch on the front top edge of the Logitech F710 is set to **`X`** (XInput mode) for native Linux driver support without extra software.
+> The Logitech F710 switch on the front top edge can be set to either **`X`** (XInput) or **`D`** (DirectInput)—both are automatically detected and supported via `evdev`! If using 'D' mode, make sure the MODE light is OFF so the sticks are active.
 
 | Control Input | Function | Description |
 | :--- | :--- | :--- |
-| **Left Stick (Vertical)** | **Drive Forward / Backward ($v$)** | Push Forward to drive forward, Pull Back to reverse |
-| **Right Stick (Horizontal)**| **Steer Left / Right ($\omega$)** | Push Left to turn counter-clockwise, Right to turn clockwise |
-| **Left Bumper (LB)** | **Speed UP (+)** | Increases speed level by 1 gear (20% → 40% → 60% → 80% → 100%) |
-| **Right Bumper (RB)** | **Speed DOWN (-)** | Decreases speed level by 1 gear (100% → 80% → 60% → 40% → 20%) |
-| **Button B / BACK** | **EMERGENCY STOP** | Instantly halts both motors and engages electric brake |
-| **Button A / START**| **Clear E-Stop** | Clears the emergency stop latch and re-arms the drive base |
-| **D-Pad (Up/Down/Left/Right)** | **Fine Inching** | Precision low-speed pulse nudging for docking maneuvers |
+| **Left Stick (Vertical)** | **Drive Forward / Backward** | Push **Forward** to drive forward, Pull **Back** to reverse |
+| **Right Stick (Horizontal)**| **Steer Left / Right** | Push **Left** to steer CCW, Push **Right** to steer CW |
+| **Left Bumper (LB)** | **Speed UP (+)** | Increases speed: 50 → 100 → 150 → 200 RPM |
+| **Right Bumper (RB)** | **Speed DOWN (-)** | Decreases speed: 200 → 150 → 100 → 50 RPM |
+| **Button B** | **Brake** | Hold to engage electric brake and rapidly decelerate |
+| **START** | **Exit** | Smoothly stops motors and exits program |
 
 ---
 

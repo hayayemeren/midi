@@ -8,6 +8,7 @@ Synchronous Request-Response transactions prevent half-duplex RS485 bus collisio
 from __future__ import annotations
 
 import logging
+import os
 import struct
 import threading
 import time
@@ -18,23 +19,25 @@ logger = logging.getLogger("midi.ddsm")
 
 
 def calculate_crc8(data: bytes) -> int:
-    """Calculate CRC-8/MAXIM (Dallas/Maxim, poly 0x8C, init 0x00, reflected).
-    
-    Args:
-        data: Byte payload to checksum.
-        
-    Returns:
-        1-byte CRC checksum as integer (0-255).
-    """
+    """Calculate CRC-8/MAXIM (Dallas/Maxim, poly 0x8C, init 0x00, reflected)."""
     crc = 0x00
     for byte in data:
         crc ^= byte
         for _ in range(8):
-            if crc & 0x01:
-                crc = (crc >> 1) ^ 0x8C
-            else:
-                crc >>= 1
+            crc = (crc >> 1) ^ 0x8C if crc & 1 else crc >> 1
     return crc & 0xFF
+
+
+def set_usb_latency_1ms(port: str):
+    """Set FTDI / USB-serial converter latency timer from default 16ms to 1ms on Linux."""
+    yol = f"/sys/bus/usb-serial/devices/{os.path.basename(port)}/latency_timer"
+    try:
+        with open(yol, "w") as f:
+            f.write("1")
+        logger.info("USB serial latency timer set to 1 ms on %s", yol)
+    except Exception:
+        # Requires root or udev rule; continue gracefully if not writable
+        pass
 
 
 @dataclass
@@ -56,27 +59,13 @@ class MotorFeedback:
 
     @classmethod
     def from_bytes(cls, data: bytes, speed_scale: float = 1.0) -> Optional[MotorFeedback]:
-        """Parse 10-byte feedback frame from DDSM motor.
-        
-        Frame layout:
-          Byte 0: Motor ID
-          Byte 1: Mode (0x01: Current, 0x02: Velocity, 0x03: Position)
-          Byte 2-3: Current (int16, Big-Endian)
-          Byte 4-5: Velocity (int16, Big-Endian)
-          Byte 6-7: Position (int16/uint16, Big-Endian)
-          Byte 8: Error code bitmask
-          Byte 9: CRC-8
-        """
+        """Parse 10-byte feedback frame from DDSM motor."""
         if len(data) != 10:
             return None
 
         # Verify CRC
         expected_crc = calculate_crc8(data[:9])
         if data[9] != expected_crc:
-            logger.warning(
-                "CRC mismatch for motor %d: expected 0x%02X, got 0x%02X",
-                data[0], expected_crc, data[9]
-            )
             return None
 
         motor_id = data[0]
@@ -125,22 +114,12 @@ class DDSMDriver:
         dry_run: bool = False,
         motor_type: str = "ddsm115",
     ):
-        """Initialize DDSM RS485 driver.
-        
-        Args:
-            port: Serial device path (e.g., /dev/ttyUSB0).
-            baudrate: Baudrate (default 115200).
-            timeout: Read timeout in seconds (default 0.02s).
-            dry_run: If True, simulate communication without opening hardware serial port.
-            motor_type: 'ddsm115' (1 RPM increments) or 'ddsm210' (0.1 RPM increments).
-        """
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
         self.dry_run = dry_run
         self.motor_type = motor_type.lower()
         
-        # Scaling factor: DDSM115 cmd is 1 rpm, DDSM210 is 0.1 rpm
         self.speed_scale = 10.0 if self.motor_type == "ddsm210" else 1.0
 
         self.serial = None
@@ -154,6 +133,9 @@ class DDSMDriver:
             logger.info("DDSMDriver running in DRY-RUN simulation mode (no serial hardware).")
             self.connected = True
             return True
+
+        # Optimize USB latency
+        set_usb_latency_1ms(self.port)
 
         try:
             import serial
@@ -185,104 +167,99 @@ class DDSMDriver:
             logger.info("DDSM RS485 bus closed.")
 
     def set_mode(self, motor_id: int, mode: int = MODE_VELOCITY) -> bool:
-        """Switch motor operating mode.
-        
-        Packet: [ID, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, Mode]
-        (Mode frame has no CRC, the 10th byte is the mode byte).
-        """
-        packet = bytearray(10)
-        packet[0] = motor_id & 0xFF
-        packet[1] = self.CMD_SWITCH_MODE
-        packet[9] = mode & 0xFF
-
-        return self._transact(bytes(packet), motor_id=motor_id, expect_response=False) is not None
+        """Switch motor operating mode (Velocity Loop = 0x02)."""
+        packet = bytes([motor_id & 0xFF, self.CMD_SWITCH_MODE, 0, 0, 0, 0, 0, 0, 0, mode & 0xFF])
+        with self._lock:
+            if self.dry_run:
+                return True
+            if not self.serial or not self.serial.is_open:
+                return False
+            try:
+                self.serial.write(packet)
+                self.serial.flush()
+                time.sleep(0.05)
+                return True
+            except Exception as e:
+                logger.warning("Error setting mode on motor %d: %s", motor_id, e)
+                return False
 
     def set_velocity(
         self,
         motor_id: int,
         target_rpm: float,
-        acceleration: int = 50,
+        acceleration: int = 1,
         brake: bool = False,
-    ) -> bool:
-        """Send velocity command to motor and read synchronous telemetry response.
+    ) -> Optional[MotorFeedback]:
+        """Send velocity command to motor and read synchronous 10-byte response.
         
-        Args:
-            motor_id: ID of target motor (e.g., 1 or 2).
-            target_rpm: Target rotational speed in RPM (signed).
-            acceleration: Acceleration ramp time (0-255, 0.1 ms/rev).
-            brake: If True, engages electric brake (speed forced to 0).
+        Packet layout:
+          [ID, 0x64, Speed_H, Speed_L, 0, 0, Accel, Brake, 0, CRC8]
+        Notice Byte 6 is Acceleration (1..255). Byte 4 and 5 are 0.
         """
-        raw_speed = int(round(target_rpm * self.speed_scale))
-        raw_speed = max(-32767, min(32767, raw_speed))
-
-        accel_val = max(0, min(65535, acceleration))
+        rpm = max(-330, min(330, int(round(target_rpm * self.speed_scale))))
+        v = rpm & 0xFFFF
         brake_val = 0xFF if brake else 0x00
-        if brake:
-            raw_speed = 0
+        accel_byte = max(1, min(255, acceleration))
 
-        packet = bytearray(10)
-        packet[0] = motor_id & 0xFF
-        packet[1] = self.CMD_VELOCITY_DRIVE
-        struct.pack_into(">h", packet, 2, raw_speed)
-        struct.pack_into(">H", packet, 4, accel_val)
-        packet[6] = 0x00
-        packet[7] = brake_val
-        packet[8] = 0x00
-        packet[9] = calculate_crc8(bytes(packet[:9]))
-
-        # DDSM responds with 10 bytes to CMD_VELOCITY_DRIVE (0x64)
-        resp = self._transact(bytes(packet), motor_id=motor_id, expect_response=True)
-        return True if self.dry_run else (resp is not None)
-
-    def emergency_brake(self, motor_id: int) -> bool:
-        """Immediately engage brake on specified motor."""
-        return self.set_velocity(motor_id=motor_id, target_rpm=0.0, brake=True)
-
-    def query_feedback(self, motor_id: int, force_query: bool = False) -> Optional[MotorFeedback]:
-        """Query motor for current telemetry status.
-        
-        Returns cached telemetry from the continuous velocity loop, or actively queries
-        via 0x74 frame if requested or no telemetry is cached yet.
-        """
-        if not force_query and motor_id in self.latest_telemetry:
-            return self.latest_telemetry[motor_id]
-
-        packet = bytearray(10)
-        packet[0] = motor_id & 0xFF
-        packet[1] = self.CMD_QUERY_FEEDBACK
-        packet[9] = calculate_crc8(bytes(packet[:9]))
+        nine = [
+            motor_id & 0xFF,
+            self.CMD_VELOCITY_DRIVE,
+            (v >> 8) & 0xFF,
+            v & 0xFF,
+            0x00,
+            0x00,
+            accel_byte,
+            brake_val,
+            0x00,
+        ]
+        pkt = bytes(nine) + bytes([calculate_crc8(bytes(nine))])
 
         if self.dry_run:
             sim_fb = MotorFeedback(
                 motor_id=motor_id,
                 mode=self.MODE_VELOCITY,
-                velocity_rpm=0.0,
+                velocity_rpm=float(target_rpm),
                 current_amps=0.2,
                 timestamp=time.time(),
             )
             self.latest_telemetry[motor_id] = sim_fb
             return sim_fb
 
-        self._transact(bytes(packet), motor_id=motor_id, expect_response=True)
+        with self._lock:
+            if not self.serial or not self.serial.is_open:
+                return None
+            try:
+                # Flush input buffer before transmission to guarantee no stale bytes
+                self.serial.reset_input_buffer()
+                self.serial.write(pkt)
+                self.serial.flush()
+
+                # Read 10-byte feedback frame immediately
+                r = self.serial.read(10)
+                if len(r) == 10 and calculate_crc8(r[:9]) == r[9] and r[0] == motor_id:
+                    fb = MotorFeedback.from_bytes(r, speed_scale=(1.0 / self.speed_scale))
+                    if fb:
+                        self.latest_telemetry[motor_id] = fb
+                        return fb
+            except Exception as e:
+                logger.warning("RS485 drive error on motor %d: %s", motor_id, e)
+        return None
+
+    def emergency_brake(self, motor_id: int) -> bool:
+        """Immediately engage brake on specified motor."""
+        fb = self.set_velocity(motor_id=motor_id, target_rpm=0.0, acceleration=1, brake=True)
+        return fb is not None
+
+    def query_feedback(self, motor_id: int) -> Optional[MotorFeedback]:
+        """Return latest feedback from motor."""
         return self.latest_telemetry.get(motor_id)
 
     def set_motor_id(self, new_id: int) -> bool:
-        """Program new ID into connected motor.
-        
-        CRITICAL: ONLY ONE MOTOR MUST BE CONNECTED TO THE RS485 BUS!
-        Packet: [0xAA, 0x55, 0x53, new_id, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
-        Sent 5 times consecutively per manufacturer specification.
-        """
+        """Program new ID into connected motor (send 5 times)."""
         if not (1 <= new_id <= 254):
             raise ValueError(f"Motor ID must be between 1 and 254, got {new_id}")
 
-        packet = bytearray(10)
-        packet[0] = 0xAA
-        packet[1] = 0x55
-        packet[2] = 0x53
-        packet[3] = new_id & 0xFF
-
-        logger.info("Broadcasting ID change to %d (sending 5 frames)...", new_id)
+        packet = bytes([0xAA, 0x55, 0x53, new_id & 0xFF, 0, 0, 0, 0, 0, 0])
         if self.dry_run:
             return True
 
@@ -298,36 +275,3 @@ class DDSMDriver:
             except Exception as e:
                 logger.error("Failed to send set ID command: %s", e)
                 return False
-
-    def _transact(self, packet: bytes, motor_id: int = 0, expect_response: bool = True) -> Optional[bytes]:
-        """Transmit frame over RS485 and synchronously read response to prevent bus contention."""
-        if self.dry_run:
-            return b"\x00" * 10
-
-        with self._lock:
-            if not self.serial or not self.serial.is_open:
-                return None
-            try:
-                # Discard any stale bytes in input buffer
-                if self.serial.in_waiting > 0:
-                    self.serial.read(self.serial.in_waiting)
-
-                # Send command packet
-                self.serial.write(packet)
-                self.serial.flush()
-
-                # Read 10-byte response if expected
-                if expect_response:
-                    resp = self.serial.read(10)
-                    if len(resp) == 10:
-                        fb = MotorFeedback.from_bytes(resp, speed_scale=(1.0 / self.speed_scale))
-                        if fb and motor_id > 0:
-                            self.latest_telemetry[motor_id] = fb
-                        return resp
-                    elif len(resp) > 0:
-                        logger.debug("Partial response from motor %d: %d bytes", motor_id, len(resp))
-                else:
-                    return b""
-            except Exception as e:
-                logger.warning("RS485 communication error: %s", e)
-        return None

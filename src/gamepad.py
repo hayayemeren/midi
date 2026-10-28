@@ -1,391 +1,231 @@
-"""Logitech Wireless Gamepad F710 / Generic Joystick Interface.
+"""Logitech Wireless Gamepad F710 Driver using Python evdev.
 
-Reads joystick and button events from Linux /dev/input/js* interface without
-requiring X11, SDL, or external heavy GUI frameworks.
-Supports XInput and DirectInput modes, auto-reconnect, deadband filtering,
-and safety deadman/emergency stop triggers.
+Provides synchronous, zero-latency polling matching hardware evdev capabilities.
+Supports both XInput (X mode) and DirectInput (D mode).
 """
 
 from __future__ import annotations
 
-import glob
 import logging
 import math
 import os
-import struct
-import threading
 import time
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger("midi.gamepad")
 
-# Linux joystick event constants
-JS_EVENT_BUTTON = 0x01
-JS_EVENT_AXIS = 0x02
-JS_EVENT_INIT = 0x80
+try:
+    import evdev
+    from evdev import ecodes as E
+    EVDEV_AVAILABLE = True
+except ImportError:
+    EVDEV_AVAILABLE = False
+    E = None
+
+# Gamepad Button Codes for XInput and DirectInput modes
+TUS_FREN  = {E.BTN_EAST, E.BTN_THUMB2} if E else {0x131, 0x121}  # B button
+TUS_LB    = {E.BTN_TL, E.BTN_TOP2} if E else {0x136, 0x124}      # Left Bumper (Speed UP)
+TUS_RB    = {E.BTN_TR, E.BTN_PINKIE} if E else {0x137, 0x125}    # Right Bumper (Speed DOWN)
+TUS_START = {E.BTN_START, E.BTN_BASE4} if E else {0x13b, 0x129}  # START button
 
 
 @dataclass
 class GamepadState:
-    """Thread-safe snapshot of gamepad control inputs."""
-    # Normalized sticks (-1.0 to +1.0)
-    left_stick_x: float = 0.0
-    left_stick_y: float = 0.0   # Forward (+1.0) / Backward (-1.0)
-    right_stick_x: float = 0.0  # Turn Left (-1.0) / Turn Right (+1.0)
-    right_stick_y: float = 0.0
-
-    # Triggers (-1.0 unpressed to +1.0 fully pressed, or 0.0 to 1.0)
-    left_trigger: float = 0.0
-    right_trigger: float = 0.0
-
-    # D-pad (-1.0, 0.0, +1.0)
-    dpad_x: float = 0.0
-    dpad_y: float = 0.0
-
-    # Buttons (True when pressed)
-    button_a: bool = False
-    button_b: bool = False
-    button_x: bool = False
-    button_y: bool = False
-    button_lb: bool = False  # Left Bumper (Speed UP)
-    button_rb: bool = False  # Right Bumper (Speed DOWN)
-    button_back: bool = False
-    button_start: bool = False
-    button_guide: bool = False
-
-    # State metadata
+    """Snapshot of gamepad inputs."""
+    forward: float = 0.0          # -1.0 (Reverse) to +1.0 (Forward)
+    turn: float = 0.0             # -1.0 (Right/CW) to +1.0 (Left/CCW)
+    brake: bool = False           # True if B is pressed
+    button_lb_pressed: bool = False
+    button_rb_pressed: bool = False
+    button_start_pressed: bool = False
     connected: bool = False
-    emergency_stop_latched: bool = False
-    speed_level: int = 3
-    max_speed_levels: int = 5
-    speed_multiplier: float = 0.60
-    speed_mode: str = "Level 3 (60%)"
-    last_event_time: float = 0.0
+    device_name: str = "None"
+    speed_level: int = 2          # Current speed level index
+    speed_rpm: float = 100.0
 
 
 class F710Gamepad:
-    """Logitech F710 Wireless Gamepad Controller."""
+    """Synchronous Gamepad reader using evdev (Zero-lag)."""
 
     def __init__(
         self,
         device_path: Optional[str] = None,
         deadzone: float = 0.10,
-        expo: float = 1.4,
-        require_deadman: bool = False,
         speed_levels: Optional[List[float]] = None,
-        default_speed_level: int = 3,
+        default_speed_level: int = 2,
     ):
-        """Args:
-            device_path: Explicit device path (e.g. /dev/input/js0). If None, auto-detects.
-            deadzone: Analog stick deadband (0.0 to 1.0).
-            expo: Exponential curve factor for smooth low-speed control.
-            require_deadman: If True, Left Bumper (LB) must be held down to drive.
-            speed_levels: List of speed scale multipliers (e.g. [0.2, 0.4, 0.6, 0.8, 1.0]).
-            default_speed_level: Initial speed level (1-indexed).
-        """
         self.device_path = device_path
         self.deadzone = deadzone
-        self.expo = expo
-        self.require_deadman = require_deadman
+        self.speed_levels = speed_levels or [50.0, 100.0, 150.0, 200.0]
+        self.speed_level = max(0, min(len(self.speed_levels) - 1, default_speed_level))
 
-        self.speed_levels = speed_levels or [0.20, 0.40, 0.60, 0.80, 1.00]
-        self.default_speed_level = max(1, min(len(self.speed_levels), default_speed_level))
+        self.dev = None
+        self.ax: Dict[int, Tuple[int, int]] = {}     # code -> (min, max)
+        self.val: Dict[int, int] = {}                # code -> current raw value
+        self.btn: Set[int] = set()                   # currently held buttons
+        self.pressed: List[int] = []                 # buttons pressed this cycle
+        self.turn_code: Optional[int] = None
+        self.connected = False
+        self.device_name = "Not Connected"
+        self._last_reconnect_attempt = 0.0
 
-        self._state = GamepadState()
-        self._state.max_speed_levels = len(self.speed_levels)
-        self._state.speed_level = self.default_speed_level
-        self._state.speed_multiplier = self.speed_levels[self.default_speed_level - 1]
-        self._state.speed_mode = f"Level {self._state.speed_level} ({self._state.speed_multiplier*100:.0f}%)"
+    @staticmethod
+    def inspect(path: str):
+        """Check if device has necessary sticks and keys for Logitech gamepad."""
+        if not EVDEV_AVAILABLE:
+            return None, {}, set(), False, "evdev library not installed"
+        try:
+            d = evdev.InputDevice(path)
+            caps = dict(d.capabilities(absinfo=True))
+            axes = {c: info for c, info in caps.get(E.EV_ABS, [])}
+            keys = set(caps.get(E.EV_KEY, []))
+            pad_keys = any(0x120 <= k <= 0x13F for k in keys)
 
-        self._prev_lb = False
-        self._prev_rb = False
+            if not (E.ABS_X in axes and E.ABS_Y in axes):
+                return d, axes, keys, False, "Left stick (ABS_X/ABS_Y) missing"
+            if not pad_keys:
+                return d, axes, keys, False, "Gamepad button keys missing"
+            if not (E.ABS_RX in axes or E.ABS_Z in axes):
+                return d, axes, keys, False, "Right stick (ABS_RX/ABS_Z) missing"
 
-        self._lock = threading.Lock()
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
-        self._fd: Optional[int] = None
-        self._device_name: str = "Unknown"
-        self._is_xinput: bool = True
+            return d, axes, keys, True, "OK"
+        except Exception as e:
+            return None, {}, set(), False, str(e)
 
-    def start(self):
-        """Start background reader thread."""
-        if self._running:
-            return
-        self._running = True
-        self._thread = threading.Thread(target=self._worker_loop, name="GamepadWorker", daemon=True)
-        self._thread.start()
-        logger.info("Gamepad worker thread started.")
-
-    def stop(self):
-        """Stop background reader thread."""
-        self._running = False
-        self._close_device()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
-        logger.info("Gamepad worker thread stopped.")
-
-    def speed_up(self):
-        """Increase speed gear/level by 1 (triggered by Left Bumper)."""
-        with self._lock:
-            if self._state.speed_level < len(self.speed_levels):
-                self._state.speed_level += 1
-                self._state.speed_multiplier = self.speed_levels[self._state.speed_level - 1]
-                self._state.speed_mode = f"Level {self._state.speed_level} ({self._state.speed_multiplier*100:.0f}%)"
-                logger.info("[GAMEPAD] Speed UP -> %s", self._state.speed_mode)
-
-    def speed_down(self):
-        """Decrease speed gear/level by 1 (triggered by Right Bumper)."""
-        with self._lock:
-            if self._state.speed_level > 1:
-                self._state.speed_level -= 1
-                self._state.speed_multiplier = self.speed_levels[self._state.speed_level - 1]
-                self._state.speed_mode = f"Level {self._state.speed_level} ({self._state.speed_multiplier*100:.0f}%)"
-                logger.info("[GAMEPAD] Speed DOWN -> %s", self._state.speed_mode)
-
-    def get_state(self) -> GamepadState:
-        """Return a thread-safe copy of the current gamepad state."""
-        with self._lock:
-            return GamepadState(
-                left_stick_x=self._state.left_stick_x,
-                left_stick_y=self._state.left_stick_y,
-                right_stick_x=self._state.right_stick_x,
-                right_stick_y=self._state.right_stick_y,
-                left_trigger=self._state.left_trigger,
-                right_trigger=self._state.right_trigger,
-                dpad_x=self._state.dpad_x,
-                dpad_y=self._state.dpad_y,
-                button_a=self._state.button_a,
-                button_b=self._state.button_b,
-                button_x=self._state.button_x,
-                button_y=self._state.button_y,
-                button_lb=self._state.button_lb,
-                button_rb=self._state.button_rb,
-                button_back=self._state.button_back,
-                button_start=self._state.button_start,
-                button_guide=self._state.button_guide,
-                connected=self._state.connected,
-                emergency_stop_latched=self._state.emergency_stop_latched,
-                speed_level=self._state.speed_level,
-                max_speed_levels=self._state.max_speed_levels,
-                speed_multiplier=self._state.speed_multiplier,
-                speed_mode=self._state.speed_mode,
-                last_event_time=self._state.last_event_time,
-            )
-
-    def get_drive_command(self) -> tuple[float, float, bool]:
-        """Compute drive throttle and steering commands from current state.
-        
-        Controls:
-          - Left Stick Y  : Forward / Backward (linear velocity v)
-          - Right Stick X : Left / Right (angular velocity omega)
-          - Speed Scaling : Controlled by LB (Speed Up) and RB (Speed Down)
-        
-        Returns:
-            Tuple of (linear_throttle [-1..1], angular_steering [-1..1], is_active [bool])
-        """
-        state = self.get_state()
-
-        # Safety checks
-        if not state.connected or state.emergency_stop_latched:
-            return 0.0, 0.0, False
-
-        # Deadman check (if enabled)
-        if self.require_deadman and not state.button_lb:
-            return 0.0, 0.0, False
-
-        multiplier = state.speed_multiplier
-
-        # Left stick Y = Forward / Backward
-        # Right stick X = Left / Right Steering
-        linear = state.left_stick_y * multiplier
-        # Invert right_stick_x: pushing LEFT (-1) produces positive angular speed (CCW turn)
-        angular = -state.right_stick_x * multiplier
-
-        # Allow D-Pad for fine inching (uses minimum crawl speed)
-        if abs(linear) < 0.05 and abs(angular) < 0.05:
-            min_speed = self.speed_levels[0]
-            if state.dpad_y != 0.0:
-                linear = state.dpad_y * min_speed
-            if state.dpad_x != 0.0:
-                angular = -state.dpad_x * min_speed
-
-        return linear, angular, True
-
-    def reset_estop(self):
-        """Clear latched emergency stop state."""
-        with self._lock:
-            self._state.emergency_stop_latched = False
-            logger.info("Emergency Stop latch cleared.")
-
-    def _apply_deadzone_and_expo(self, raw_val: float) -> float:
-        """Apply deadband filtering and exponential response curve."""
-        if abs(raw_val) < self.deadzone:
-            return 0.0
-        # Normalize range outside deadzone to 0.0 - 1.0
-        normalized = (abs(raw_val) - self.deadzone) / (1.0 - self.deadzone)
-        # Apply exponential curve
-        curved = math.pow(normalized, self.expo)
-        return math.copysign(curved, raw_val)
-
-    def _find_device(self) -> Optional[str]:
-        """Locate joystick device path."""
-        if self.device_path and os.path.exists(self.device_path):
-            return self.device_path
-
-        # Check by-id symlinks first for Logitech F710
-        f710_candidates = glob.glob("/dev/input/by-id/*F710*") + glob.glob("/dev/input/by-id/*Logitech*")
-        for cand in f710_candidates:
-            if "js" in os.path.basename(cand) or "event" not in cand:
-                return cand
-
-        # Fall back to standard js devices
-        js_devices = sorted(glob.glob("/dev/input/js*"))
-        if js_devices:
-            return js_devices[0]
-
-        return None
-
-    def _open_device(self) -> bool:
-        """Attempt to open joystick device."""
-        path = self._find_device()
-        if not path:
+    def connect(self, force_path: Optional[str] = None, verbose: bool = False) -> bool:
+        """Find and open the Logitech F710 device."""
+        if not EVDEV_AVAILABLE:
+            logger.warning("evdev library is not available.")
             return False
+
+        paths = [force_path] if force_path else evdev.list_devices()
+        for path in paths:
+            try:
+                d, axes, keys, ok, why = self.inspect(path)
+            except Exception as e:
+                if verbose:
+                    logger.debug("Device %s check failed: %s", path, e)
+                continue
+
+            if not ok:
+                if verbose:
+                    logger.debug("Skipping %s: %s", path, why)
+                continue
+
+            # Right stick X: XInput is ABS_RX, DirectInput is ABS_Z
+            turn = E.ABS_RX if E.ABS_RX in axes else E.ABS_Z
+            self.dev = d
+            self.turn_code = turn
+            self.ax = {c: (i.min, i.max) for c, i in axes.items()}
+            self.val = {c: i.value for c, i in axes.items()}
+            self.btn.clear()
+            self.connected = True
+            self.device_name = d.name
+
+            mode_str = "XInput (X)" if turn == E.ABS_RX else "DirectInput (D)"
+            logger.info("Gamepad connected: %s on %s (%s)", d.name, path, mode_str)
+            return True
+
+        self.connected = False
+        return False
+
+    def norm(self, code: int) -> float:
+        """Normalize analog axis value using hardware calibrated range."""
+        lo, hi = self.ax.get(code, (-32767, 32767))
+        center = (lo + hi) / 2.0
+        half_span = (hi - lo) / 2.0 or 1.0
+
+        v = self.val.get(code, int(center))
+        x = (v - center) / half_span
+        x = max(-1.0, min(1.0, x))
+
+        if abs(x) < self.deadzone:
+            return 0.0
+
+        # Continuous scale starting immediately from 0 beyond deadzone
+        return math.copysign((abs(x) - self.deadzone) / (1.0 - self.deadzone), x)
+
+    def poll(self) -> GamepadState:
+        """Synchronously drain all pending kernel events and return real-time state.
+        
+        Zero queue lag: reads all events with read_one() until None.
+        """
+        self.pressed = []
+        now = time.time()
+
+        if self.dev is None:
+            if now - self._last_reconnect_attempt > 1.0:
+                self._last_reconnect_attempt = now
+                self.connect(self.device_path)
+            if self.dev is None:
+                return GamepadState(
+                    connected=False,
+                    speed_level=self.speed_level,
+                    speed_rpm=self.speed_levels[self.speed_level],
+                )
 
         try:
-            self._fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-            logger.info("Opened gamepad device: %s", path)
-            with self._lock:
-                self._state.connected = True
-                self._state.last_event_time = time.time()
-            return True
-        except Exception as e:
-            logger.debug("Failed to open %s: %s", path, e)
-            self._fd = None
-            return False
+            # Drain all pending events in kernel buffer
+            while True:
+                ev = self.dev.read_one()
+                if ev is None:
+                    break
+                if ev.type == E.EV_ABS:
+                    self.val[ev.code] = ev.value
+                elif ev.type == E.EV_KEY:
+                    if ev.value == 1:
+                        self.btn.add(ev.code)
+                        self.pressed.append(ev.code)
+                    elif ev.value == 0:
+                        self.btn.discard(ev.code)
 
-    def _close_device(self):
-        """Close opened file descriptor."""
-        if self._fd is not None:
+        except OSError:
+            logger.warning("Gamepad disconnected!")
+            self.dev = None
+            self.connected = False
+            return GamepadState(
+                connected=False,
+                speed_level=self.speed_level,
+                speed_rpm=self.speed_levels[self.speed_level],
+            )
+
+        # Handle speed level adjustments: LB = speed up, RB = speed down
+        for btn in self.pressed:
+            if btn in TUS_LB:
+                self.speed_level = min(len(self.speed_levels) - 1, self.speed_level + 1)
+                logger.info("[GAMEPAD] Speed UP (LB): Level %d (%.0f RPM)", self.speed_level + 1, self.speed_levels[self.speed_level])
+            elif btn in TUS_RB:
+                self.speed_level = max(0, self.speed_level - 1)
+                logger.info("[GAMEPAD] Speed DOWN (RB): Level %d (%.0f RPM)", self.speed_level + 1, self.speed_levels[self.speed_level])
+
+        # Compute analog stick values:
+        # Left Stick Y: Push Forward = positive (+1), Pull Back = negative (-1)
+        raw_fwd = -self.norm(E.ABS_Y)
+        # Right Stick X: Push Left = positive (+1 CCW turn), Push Right = negative (-1 CW turn)
+        raw_turn = -self.norm(self.turn_code) if self.turn_code else 0.0
+
+        brake_active = bool(TUS_FREN & self.btn)
+        start_pressed = bool(TUS_START & set(self.pressed))
+
+        return GamepadState(
+            forward=raw_fwd,
+            turn=raw_turn,
+            brake=brake_active,
+            button_lb_pressed=bool(TUS_LB & set(self.pressed)),
+            button_rb_pressed=bool(TUS_RB & set(self.pressed)),
+            button_start_pressed=start_pressed,
+            connected=True,
+            device_name=self.device_name,
+            speed_level=self.speed_level,
+            speed_rpm=self.speed_levels[self.speed_level],
+        )
+
+    def close(self):
+        if self.dev:
             try:
-                os.close(self._fd)
+                self.dev.close()
             except Exception:
                 pass
-            self._fd = None
-        with self._lock:
-            self._state.connected = False
-            self._state.left_stick_x = 0.0
-            self._state.left_stick_y = 0.0
-            self._state.right_stick_x = 0.0
-            self._state.right_stick_y = 0.0
-
-    def _worker_loop(self):
-        """Background thread reading /dev/input/js* events with zero lag."""
-        import select
-
-        event_size = struct.calcsize("IhBB")
-
-        while self._running:
-            if self._fd is None:
-                if not self._open_device():
-                    time.sleep(1.0)
-                    continue
-
-            try:
-                # Use select with 50ms timeout: zero CPU burn, instant wakeup on new events
-                r, _, _ = select.select([self._fd], [], [], 0.05)
-                if not r:
-                    continue
-
-                # Drain ALL queued events in the kernel buffer immediately
-                while True:
-                    try:
-                        raw_data = os.read(self._fd, 1024)
-                        if not raw_data:
-                            break
-
-                        for offset in range(0, len(raw_data) - event_size + 1, event_size):
-                            chunk = raw_data[offset : offset + event_size]
-                            event_time, value, event_type, number = struct.unpack("IhBB", chunk)
-                            pure_type = event_type & ~JS_EVENT_INIT
-
-                            if pure_type == JS_EVENT_BUTTON:
-                                self._handle_button(number, bool(value))
-                            elif pure_type == JS_EVENT_AXIS:
-                                self._handle_axis(number, value)
-
-                    except BlockingIOError:
-                        break  # Kernel buffer completely drained to current real-time state!
-
-            except (OSError, Exception) as e:
-                logger.warning("Gamepad disconnected or read error: %s", e)
-                self._close_device()
-                time.sleep(1.0)
-
-    def _handle_button(self, number: int, pressed: bool):
-        """Process button press/release events."""
-        with self._lock:
-            self._state.last_event_time = time.time()
-
-            # Map standard XInput / DirectInput buttons
-            if number == 0:  # A button -> Reset E-Stop
-                self._state.button_a = pressed
-                if pressed and self._state.emergency_stop_latched:
-                    self._state.emergency_stop_latched = False
-                    logger.info("[GAMEPAD] E-Stop reset by button A.")
-            elif number == 1:  # B button -> Emergency Stop
-                self._state.button_b = pressed
-                if pressed:
-                    self._state.emergency_stop_latched = True
-                    logger.warning("[GAMEPAD] EMERGENCY STOP triggered by button B!")
-            elif number == 2:  # X button
-                self._state.button_x = pressed
-            elif number == 3:  # Y button
-                self._state.button_y = pressed
-            elif number == 4:  # LB (Left Bumper) -> SPEED UP
-                self._state.button_lb = pressed
-                if pressed and not self._prev_lb:
-                    self.speed_up()
-                self._prev_lb = pressed
-            elif number == 5:  # RB (Right Bumper) -> SPEED DOWN
-                self._state.button_rb = pressed
-                if pressed and not self._prev_rb:
-                    self.speed_down()
-                self._prev_rb = pressed
-            elif number == 6:  # Back button -> E-Stop
-                self._state.button_back = pressed
-                if pressed:
-                    self._state.emergency_stop_latched = True
-                    logger.warning("[GAMEPAD] EMERGENCY STOP triggered by BACK button!")
-            elif number == 7:  # Start button -> Reset E-Stop
-                self._state.button_start = pressed
-                if pressed and self._state.emergency_stop_latched:
-                    self._state.emergency_stop_latched = False
-                    logger.info("[GAMEPAD] E-Stop reset by START button.")
-            elif number == 8:  # Guide / Logitech button
-                self._state.button_guide = pressed
-
-    def _handle_axis(self, number: int, raw_value: int):
-        """Process analog stick and trigger movements."""
-        norm_val = raw_value / 32767.0
-        norm_val = max(-1.0, min(1.0, norm_val))
-
-        with self._lock:
-            self._state.last_event_time = time.time()
-
-            if number == 0:  # Left stick X (Horizontal)
-                self._state.left_stick_x = self._apply_deadzone_and_expo(norm_val)
-            elif number == 1:  # Left stick Y (Vertical, invert so Push Forward is +1.0)
-                self._state.left_stick_y = self._apply_deadzone_and_expo(-norm_val)
-            elif number == 2:  # LT (Left Trigger)
-                self._state.left_trigger = (norm_val + 1.0) / 2.0
-            elif number == 3:  # Right stick X (Horizontal, Steering)
-                self._state.right_stick_x = self._apply_deadzone_and_expo(norm_val)
-            elif number == 4:  # Right stick Y (Vertical)
-                self._state.right_stick_y = self._apply_deadzone_and_expo(-norm_val)
-            elif number == 5:  # RT (Right Trigger)
-                self._state.right_trigger = (norm_val + 1.0) / 2.0
-            elif number == 6:  # D-pad X
-                self._state.dpad_x = 1.0 if norm_val > 0.5 else (-1.0 if norm_val < -0.5 else 0.0)
-            elif number == 7:  # D-pad Y (invert so Up is +1.0)
-                self._state.dpad_y = -1.0 if norm_val > 0.5 else (1.0 if norm_val < -0.5 else 0.0)
+            self.dev = None
+            self.connected = False
