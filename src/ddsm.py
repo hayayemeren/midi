@@ -2,6 +2,7 @@
 
 Supports DDSM115 and DDSM210 direct drive hub motors over RS485 / UART.
 Implements the 10-byte frame protocol with CRC-8/MAXIM checksum.
+Synchronous Request-Response transactions prevent half-duplex RS485 bus collisions.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Dict, Any
 
 logger = logging.getLogger("midi.ddsm")
 
@@ -120,7 +121,7 @@ class DDSMDriver:
         self,
         port: str = "/dev/ttyUSB0",
         baudrate: int = 115200,
-        timeout: float = 0.05,
+        timeout: float = 0.02,
         dry_run: bool = False,
         motor_type: str = "ddsm115",
     ):
@@ -129,7 +130,7 @@ class DDSMDriver:
         Args:
             port: Serial device path (e.g., /dev/ttyUSB0).
             baudrate: Baudrate (default 115200).
-            timeout: Read timeout in seconds.
+            timeout: Read timeout in seconds (default 0.02s).
             dry_run: If True, simulate communication without opening hardware serial port.
             motor_type: 'ddsm115' (1 RPM increments) or 'ddsm210' (0.1 RPM increments).
         """
@@ -194,7 +195,7 @@ class DDSMDriver:
         packet[1] = self.CMD_SWITCH_MODE
         packet[9] = mode & 0xFF
 
-        return self._send_packet(bytes(packet), expect_response=False)
+        return self._transact(bytes(packet), motor_id=motor_id, expect_response=False) is not None
 
     def set_velocity(
         self,
@@ -203,7 +204,7 @@ class DDSMDriver:
         acceleration: int = 50,
         brake: bool = False,
     ) -> bool:
-        """Send velocity command to motor.
+        """Send velocity command to motor and read synchronous telemetry response.
         
         Args:
             motor_id: ID of target motor (e.g., 1 or 2).
@@ -211,9 +212,7 @@ class DDSMDriver:
             acceleration: Acceleration ramp time (0-255, 0.1 ms/rev).
             brake: If True, engages electric brake (speed forced to 0).
         """
-        # Apply scaling based on motor type
         raw_speed = int(round(target_rpm * self.speed_scale))
-        # Clamp to int16 limits
         raw_speed = max(-32767, min(32767, raw_speed))
 
         accel_val = max(0, min(65535, acceleration))
@@ -231,17 +230,23 @@ class DDSMDriver:
         packet[8] = 0x00
         packet[9] = calculate_crc8(bytes(packet[:9]))
 
-        return self._send_packet(bytes(packet), expect_response=False)
+        # DDSM responds with 10 bytes to CMD_VELOCITY_DRIVE (0x64)
+        resp = self._transact(bytes(packet), motor_id=motor_id, expect_response=True)
+        return True if self.dry_run else (resp is not None)
 
     def emergency_brake(self, motor_id: int) -> bool:
         """Immediately engage brake on specified motor."""
         return self.set_velocity(motor_id=motor_id, target_rpm=0.0, brake=True)
 
-    def query_feedback(self, motor_id: int) -> Optional[MotorFeedback]:
+    def query_feedback(self, motor_id: int, force_query: bool = False) -> Optional[MotorFeedback]:
         """Query motor for current telemetry status.
         
-        Packet: [ID, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, CRC]
+        Returns cached telemetry from the continuous velocity loop, or actively queries
+        via 0x74 frame if requested or no telemetry is cached yet.
         """
+        if not force_query and motor_id in self.latest_telemetry:
+            return self.latest_telemetry[motor_id]
+
         packet = bytearray(10)
         packet[0] = motor_id & 0xFF
         packet[1] = self.CMD_QUERY_FEEDBACK
@@ -258,25 +263,8 @@ class DDSMDriver:
             self.latest_telemetry[motor_id] = sim_fb
             return sim_fb
 
-        with self._lock:
-            if not self.serial or not self.serial.is_open:
-                return None
-            try:
-                self.serial.reset_input_buffer()
-                self.serial.write(packet)
-                self.serial.flush()
-                
-                resp = self.serial.read(10)
-                if len(resp) == 10:
-                    fb = MotorFeedback.from_bytes(resp, speed_scale=(1.0 / self.speed_scale))
-                    if fb:
-                        self.latest_telemetry[motor_id] = fb
-                        return fb
-                else:
-                    logger.debug("Motor %d query timeout: read %d bytes", motor_id, len(resp))
-            except Exception as e:
-                logger.warning("Error querying motor %d: %s", motor_id, e)
-        return None
+        self._transact(bytes(packet), motor_id=motor_id, expect_response=True)
+        return self.latest_telemetry.get(motor_id)
 
     def set_motor_id(self, new_id: int) -> bool:
         """Program new ID into connected motor.
@@ -311,18 +299,35 @@ class DDSMDriver:
                 logger.error("Failed to send set ID command: %s", e)
                 return False
 
-    def _send_packet(self, packet: bytes, expect_response: bool = False) -> bool:
-        """Internal helper to write packet to RS485 bus."""
+    def _transact(self, packet: bytes, motor_id: int = 0, expect_response: bool = True) -> Optional[bytes]:
+        """Transmit frame over RS485 and synchronously read response to prevent bus contention."""
         if self.dry_run:
-            return True
+            return b"\x00" * 10
 
         with self._lock:
             if not self.serial or not self.serial.is_open:
-                return False
+                return None
             try:
+                # Discard any stale bytes in input buffer
+                if self.serial.in_waiting > 0:
+                    self.serial.read(self.serial.in_waiting)
+
+                # Send command packet
                 self.serial.write(packet)
                 self.serial.flush()
-                return True
+
+                # Read 10-byte response if expected
+                if expect_response:
+                    resp = self.serial.read(10)
+                    if len(resp) == 10:
+                        fb = MotorFeedback.from_bytes(resp, speed_scale=(1.0 / self.speed_scale))
+                        if fb and motor_id > 0:
+                            self.latest_telemetry[motor_id] = fb
+                        return resp
+                    elif len(resp) > 0:
+                        logger.debug("Partial response from motor %d: %d bytes", motor_id, len(resp))
+                else:
+                    return b""
             except Exception as e:
-                logger.warning("RS485 write error: %s", e)
-                return False
+                logger.warning("RS485 communication error: %s", e)
+        return None

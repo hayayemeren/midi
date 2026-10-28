@@ -166,3 +166,23 @@ def test_gamepad_stick_mapping_and_speed_bumpers():
     gp.speed_down()
     assert gp._state.speed_level == 1
 
+
+def test_continuous_driving_and_instant_stop():
+    """Verify that holding stick steady produces continuous commands, and releasing immediately stops."""
+    gp = F710Gamepad()
+    gp._state.connected = True
+    gp._state.left_stick_y = 1.0  # Hold stick forward
+
+    # 1. While held, output should remain continuous and active
+    for _ in range(10):
+        lin, ang, active = gp.get_drive_command()
+        assert active
+        assert lin > 0.0
+
+    # 2. Release stick to 0.0
+    gp._state.left_stick_y = 0.0
+    lin, ang, active = gp.get_drive_command()
+    assert lin == 0.0
+    assert ang == 0.0
+
+

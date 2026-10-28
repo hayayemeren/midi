@@ -280,7 +280,9 @@ class F710Gamepad:
             self._state.right_stick_y = 0.0
 
     def _worker_loop(self):
-        """Background thread reading /dev/input/js* events."""
+        """Background thread reading /dev/input/js* events with zero lag."""
+        import select
+
         event_size = struct.calcsize("IhBB")
 
         while self._running:
@@ -290,22 +292,31 @@ class F710Gamepad:
                     continue
 
             try:
-                event_data = os.read(self._fd, event_size)
-                if not event_data or len(event_data) < event_size:
-                    time.sleep(0.01)
+                # Use select with 50ms timeout: zero CPU burn, instant wakeup on new events
+                r, _, _ = select.select([self._fd], [], [], 0.05)
+                if not r:
                     continue
 
-                event_time, value, event_type, number = struct.unpack("IhBB", event_data)
-                is_init = bool(event_type & JS_EVENT_INIT)
-                pure_type = event_type & ~JS_EVENT_INIT
+                # Drain ALL queued events in the kernel buffer immediately
+                while True:
+                    try:
+                        raw_data = os.read(self._fd, 1024)
+                        if not raw_data:
+                            break
 
-                if pure_type == JS_EVENT_BUTTON:
-                    self._handle_button(number, bool(value))
-                elif pure_type == JS_EVENT_AXIS:
-                    self._handle_axis(number, value)
+                        for offset in range(0, len(raw_data) - event_size + 1, event_size):
+                            chunk = raw_data[offset : offset + event_size]
+                            event_time, value, event_type, number = struct.unpack("IhBB", chunk)
+                            pure_type = event_type & ~JS_EVENT_INIT
 
-            except BlockingIOError:
-                time.sleep(0.01)
+                            if pure_type == JS_EVENT_BUTTON:
+                                self._handle_button(number, bool(value))
+                            elif pure_type == JS_EVENT_AXIS:
+                                self._handle_axis(number, value)
+
+                    except BlockingIOError:
+                        break  # Kernel buffer completely drained to current real-time state!
+
             except (OSError, Exception) as e:
                 logger.warning("Gamepad disconnected or read error: %s", e)
                 self._close_device()

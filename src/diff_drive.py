@@ -38,11 +38,17 @@ class SlewRateLimiter:
 
     def update(self, target: float) -> float:
         now = time.time()
-        dt = max(0.001, now - self.last_update)
+        # Clamp dt to prevent massive jumps after delays or pauses
+        dt = max(0.001, min(0.1, now - self.last_update))
         self.last_update = now
 
         max_delta = self.max_accel * dt
         delta = target - self.current_value
+
+        # Snap immediately to zero when releasing stick near deadband
+        if abs(target) < 1e-4 and abs(self.current_value) < max(0.05, max_delta):
+            self.current_value = 0.0
+            return 0.0
 
         if abs(delta) <= max_delta:
             self.current_value = target

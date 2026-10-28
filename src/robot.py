@@ -133,16 +133,24 @@ class MidiRobot:
             linear_norm, angular_norm, is_active = self.gamepad.get_drive_command()
             gp_state = self.gamepad.get_state()
 
-            # 2. Check Watchdog safety
-            time_since_event = time.time() - gp_state.last_event_time
-            gamepad_timed_out = (gp_state.connected and time_since_event > self.watchdog_timeout)
-
-            if not is_active or gamepad_timed_out:
-                # Safe Stop
+            # 2. Safety and Drive command calculation
+            if not gp_state.connected:
+                # Controller disconnected: full stop
                 target_v = 0.0
                 target_w = 0.0
-                is_braking = gp_state.emergency_stop_latched
+                is_braking = True
+            elif gp_state.emergency_stop_latched:
+                # E-stop latched: full stop and brake
+                target_v = 0.0
+                target_w = 0.0
+                is_braking = True
+            elif not is_active:
+                # Inactive / Deadman released
+                target_v = 0.0
+                target_w = 0.0
+                is_braking = False
             else:
+                # Continuous driving for as long as stick is held
                 target_v = linear_norm * self.diff_drive.dims.max_linear_speed
                 target_w = angular_norm * self.diff_drive.dims.max_angular_speed
                 is_braking = False
@@ -155,13 +163,16 @@ class MidiRobot:
             self._target_right_rpm = right_rpm
 
             # 4. Transmit velocity commands to DDSM motors
+            # Each call synchronously writes and reads back 10 bytes to keep RS485 clear
             if is_braking:
                 self.driver.emergency_brake(self.left_id)
+                time.sleep(0.002)
                 self.driver.emergency_brake(self.right_id)
             else:
                 self.driver.set_velocity(
                     self.left_id, left_rpm, acceleration=self.accel_param
                 )
+                time.sleep(0.002)
                 self.driver.set_velocity(
                     self.right_id, right_rpm, acceleration=self.accel_param
                 )
